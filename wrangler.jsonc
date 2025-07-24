@@ -2,7 +2,7 @@
  * For more details on how to configure Wrangler, refer to:
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
-{
+ {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "edo-backend-app",
 	"main": "src/index.ts",
@@ -43,19 +43,22 @@
 	 * Environment Variables for Development
 	 */
 	"vars": {
-		"ENVIRONMENT": "development"
+		"ENVIRONMENT": "development",
+		"JWT_SECRET": "<SECRT>",
+		"LANGBASE_API_KEY": "<LANGBASE_API_KEY>",
+		"LLM_API_KEY": "<LLM_API_KEY>"
 	},
 
 	/**
 	 * D1 Database Binding (uncomment and configure when needed)
 	 */
-	// "d1_databases": [
-	//   {
-	//     "binding": "DB",
-	//     "database_name": "edo-database",
-	//     "database_id": "your-database-id"
-	//   }
-	// ],
+	"d1_databases": [
+	  {
+	    "binding": "DB",
+	    "database_name": "<DB_NAME>",
+	    "database_id": "<DATABASE_ID>"
+	  }
+	],
 
 	/**
 	 * Environment-specific configurations
