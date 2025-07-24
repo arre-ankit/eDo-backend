@@ -1,6 +1,8 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { Langbase } from "langbase";
+import { sign, verify } from "hono/jwt";
+import type { Context, Next } from "hono";
 
 interface Env {
   DB: D1Database;
@@ -10,13 +12,10 @@ interface Env {
   JWT_SECRET: string;
 }
 
-// In-memory storage for task IDs (use D1 database in production)
-const TASK_STORAGE = new Map<string, {
-  taskId: string;
-  prompt: string;
-  createdAt: number;
-  status: string;
-}>();
+// JWT payload type
+interface JwtPayload {
+  email: string;
+}
 
 export class TaskProcessorDO {
   state: DurableObjectState;
@@ -162,41 +161,69 @@ app.get("/health", (c) => {
   return c.json({ status: "healthy", timestamp: new Date().toISOString() });
 });
 
-// Create a new task
-app.post("/api/tasks", async (c) => {
+// JWT Auth Middleware
+async function authMiddleware(c: Context, next: Next) {
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return c.json({ error: "Unauthorized: No token provided" }, 401);
+  }
+  const token = authHeader.split(" ")[1];
+  try {
+    const payload = (await verify(token, c.env.JWT_SECRET)) as unknown as JwtPayload;
+    if (!payload || typeof payload.email !== "string") {
+      return c.json({ error: "Unauthorized: Invalid token payload" }, 401);
+    }
+    c.set("jwtPayload", payload); // use 'jwtPayload' as key
+    await next();
+  } catch (e) {
+    return c.json({ error: "Unauthorized: Invalid token" }, 401);
+  }
+}
+
+// Login endpoint (demo: accepts email, returns JWT)
+app.post("/api/login", async (c) => {
+  const { email } = await c.req.json();
+  if (!email || typeof email !== "string") {
+    return c.json({ error: "Email is required" }, 400);
+  }
+  // Upsert user in D1 DB
+  const now = Date.now();
+  // Try to insert, if conflict, update last_login
+  await c.env.DB.prepare(
+    `INSERT INTO users (email, created_at, last_login) VALUES (?, ?, ?)
+     ON CONFLICT(email) DO UPDATE SET last_login=excluded.last_login`
+  ).bind(email, now, now).run();
+  const token = await sign({ email }, c.env.JWT_SECRET, "HS256");
+  return c.json({ token }); // Do not return email
+});
+
+// Create a new task (protected)
+app.post("/api/tasks", authMiddleware, async (c) => {
   try {
     const { prompt } = await c.req.json();
-    
     if (!prompt || typeof prompt !== "string") {
       return c.json({ error: "Prompt is required and must be a string" }, 400);
     }
-
-    // Create a unique task ID
+    const user = c.get("jwtPayload") as JwtPayload;
+    const email = user.email;
     const taskId = crypto.randomUUID();
-    
-    // Store task metadata
-    TASK_STORAGE.set(taskId, {
-      taskId,
-      prompt,
-      createdAt: Date.now(),
-      status: "pending"
-    });
-    
-    // Get the Durable Object instance
+    const createdAt = Date.now();
+    const status = "pending";
+    // Insert task into D1
+    await c.env.DB.prepare(
+      `INSERT INTO tasks (id, email, prompt, created_at, status) VALUES (?, ?, ?, ?, ?)`
+    ).bind(taskId, email, prompt, createdAt, status).run();
+    // Start processing as before
     const id = c.env.TASK_PROCESSOR.idFromName(taskId);
     const taskProcessor = c.env.TASK_PROCESSOR.get(id);
-    
-    // Initialize the task
     const response = await taskProcessor.fetch(new Request(`https://task-processor/process`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt })
     }));
-
     if (!response.ok) {
       throw new Error(`Failed to initialize task: ${response.status}`);
     }
-
     return c.json({ 
       success: true, 
       taskId,
@@ -211,32 +238,30 @@ app.post("/api/tasks", async (c) => {
   }
 });
 
-// Get task status
-app.get("/api/tasks/:id", async (c) => {
+// Get task status (protected)
+app.get("/api/tasks/:id", authMiddleware, async (c) => {
   try {
     const taskId = c.req.param("id");
-    
-    // Check if task exists
-    const taskMeta = TASK_STORAGE.get(taskId);
+    const user = c.get("jwtPayload") as JwtPayload;
+    const email = user.email;
+    // Fetch task from D1
+    const { results } = await c.env.DB.prepare(
+      `SELECT * FROM tasks WHERE id = ? AND email = ?`
+    ).bind(taskId, email).all();
+    const taskMeta = results && results[0];
     if (!taskMeta) {
       return c.json({ error: "Task not found" }, 404);
     }
-    
     // Get the Durable Object instance
     const id = c.env.TASK_PROCESSOR.idFromName(taskId);
     const taskProcessor = c.env.TASK_PROCESSOR.get(id);
-    
-    // Get task status
     const response = await taskProcessor.fetch(new Request(`https://task-processor/status`, {
       method: "GET"
     }));
-
     if (!response.ok) {
       throw new Error(`Failed to get task status: ${response.status}`);
     }
-
     const status = await response.json() as Record<string, any>;
-    
     return c.json({ 
       taskId,
       ...status
@@ -250,46 +275,38 @@ app.get("/api/tasks/:id", async (c) => {
   }
 });
 
-// List all tasks
-app.get("/api/tasks", async (c) => {
+// List all tasks (protected, only user's tasks)
+app.get("/api/tasks", authMiddleware, async (c) => {
   try {
-    const allTasks: any[] = [];
-    
-    // Get all tasks from storage
-    for (const [taskId, taskMeta] of TASK_STORAGE.entries()) {
-      try {
-        // Get detailed status from Durable Object
-        const id = c.env.TASK_PROCESSOR.idFromName(taskId);
-        const taskProcessor = c.env.TASK_PROCESSOR.get(id);
-        
-        const response = await taskProcessor.fetch(new Request(`https://task-processor/status`, {
-          method: "GET"
-        }));
-        
-        if (response.ok) {
-          const status = await response.json() as Record<string, any>;
-          allTasks.push({
-            ...taskMeta,
-            ...status
-          });
-        } else {
-          // If DO doesn't respond, use basic metadata
-          allTasks.push(taskMeta);
-        }
-      } catch (error) {
-        // If error getting detailed status, use basic metadata
-        allTasks.push(taskMeta);
-      }
-    }
-    
-    // Sort by creation date (newest first)
-    allTasks.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    
+    const user = c.get("jwtPayload") as JwtPayload;
+    const email = user.email;
+    // Fetch all tasks for user from D1
+    const { results } = await c.env.DB.prepare(
+      `SELECT id, prompt, created_at, status FROM tasks WHERE email = ? ORDER BY created_at DESC`
+    ).bind(email).all();
+    const allTasks = results || [];
+    // For each task, get status from DO (optional, can be optimized)
+    const tasksWithStatus = await Promise.all(
+      allTasks.map(async (task: any) => {
+        try {
+          const id = c.env.TASK_PROCESSOR.idFromName(task.id);
+          const taskProcessor = c.env.TASK_PROCESSOR.get(id);
+          const response = await taskProcessor.fetch(new Request(`https://task-processor/status`, {
+            method: "GET"
+          }));
+          if (response.ok) {
+            const status = await response.json() as Record<string, any>;
+            return { ...task, ...status };
+          }
+        } catch (error) {}
+        return task;
+      })
+    );
     return c.json({ 
       success: true,
-      tasks: allTasks,
-      total: allTasks.length,
-      message: "Task listing implemented with in-memory storage"
+      tasks: tasksWithStatus,
+      total: tasksWithStatus.length,
+      message: "Task listing implemented with D1 storage"
     });
   } catch (error) {
     console.error("Error listing tasks:", error);
